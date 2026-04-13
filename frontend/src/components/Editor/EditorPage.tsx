@@ -41,16 +41,85 @@ const EditorPage: React.FC = () => {
   const editorRef = useRef<unknown>(null);
   const monacoRef = useRef<unknown>(null);
 
+  
+  const loadDocument = useCallback(async () => {
+    if (!id) return;
+    try {
+      const doc = await documentService.get(id);
+      dispatch(setDocument(doc));
+    } catch {
+      toast.error('Failed to load document');
+      navigate('/');
+    }
+  }, [id, dispatch, navigate]);
+
   useEffect(() => {
     if (!id) return;
     loadDocument();
+
     return () => {
       websocketService.disconnect();
     };
-  }, [id]);
+  }, [id, loadDocument]);
+
+  
+  const handleWebSocketMessage = useCallback(
+    (message: WebSocketMessage) => {
+      switch (message.type) {
+        case 'content_change':
+          if (message.user_id !== user?.id && typeof message.content === 'string') {
+            dispatch(setContent(message.content));
+
+            if (editorRef.current) {
+              const editorInstance = editorRef.current as {
+                getValue: () => string;
+                setValue: (v: string) => void;
+              };
+
+              if (editorInstance.getValue() !== message.content) {
+                editorInstance.setValue(message.content);
+              }
+            }
+          }
+          break;
+
+        case 'user_list':
+          if (Array.isArray(message.content)) {
+            const newCollaborators: Collaborator[] = message.content
+              .filter((uid) => uid !== user?.id)
+              .map((uid, index) => ({
+                id: uid,
+                name: `User ${index + 1}`,
+                color: getCollaboratorColor(index),
+                cursor: { line: 1, column: 1 },
+              }));
+
+            setCollaboratorList(newCollaborators);
+          }
+          break;
+
+        case 'cursor_move':
+          if (message.user_id !== user?.id && typeof message.content === 'object') {
+            setCollaboratorList((prev) =>
+              prev.map((c) =>
+                c.id === message.user_id
+                  ? {
+                      ...c,
+                      cursor: message.content as { line: number; column: number },
+                    }
+                  : c
+              )
+            );
+          }
+          break;
+      }
+    },
+    [dispatch, user?.id]
+  );
 
   useEffect(() => {
     if (!id || !user) return;
+
     websocketService.connect(id, user.id);
 
     websocketService.onConnect(() => {
@@ -61,79 +130,31 @@ const EditorPage: React.FC = () => {
       dispatch(setConnected(false));
     });
 
-    const unsubscribe = websocketService.onMessage((message: WebSocketMessage) => {
-      handleWebSocketMessage(message);
-    });
+    const unsubscribe = websocketService.onMessage(handleWebSocketMessage);
 
     return () => {
       unsubscribe();
     };
-  }, [id, user?.id]);
+  }, [id, user?.id, dispatch, handleWebSocketMessage]);
 
-  const loadDocument = async () => {
-    if (!id) return;
-    try {
-      const doc = await documentService.get(id);
-      dispatch(setDocument(doc));
-    } catch {
-      toast.error('Failed to load document');
-      navigate('/');
-    }
-  };
-
-  const handleWebSocketMessage = (message: WebSocketMessage) => {
-    switch (message.type) {
-      case 'content_change':
-        if (message.user_id !== user?.id && typeof message.content === 'string') {
-          dispatch(setContent(message.content));
-          if (editorRef.current) {
-            const editorInstance = editorRef.current as { getValue: () => string; setValue: (v: string) => void };
-            if (editorInstance.getValue() !== message.content) {
-              editorInstance.setValue(message.content);
-            }
-          }
-        }
-        break;
-      case 'user_list':
-        if (Array.isArray(message.content)) {
-          const newCollaborators: Collaborator[] = message.content
-            .filter((uid) => uid !== user?.id)
-            .map((uid, index) => ({
-              id: uid,
-              name: `User ${index + 1}`,
-              color: getCollaboratorColor(index),
-              cursor: { line: 1, column: 1 },
-            }));
-          setCollaboratorList(newCollaborators);
-        }
-        break;
-      case 'cursor_move':
-        if (message.user_id !== user?.id && typeof message.content === 'object') {
-          setCollaboratorList((prev) =>
-            prev.map((c) =>
-              c.id === message.user_id ? { ...c, cursor: message.content as { line: number; column: number } } : c
-            )
-          );
-        }
-        break;
-    }
-  };
-
+  // ✅ FIXED: debounce without stale id
   const debouncedSave = useCallback(
-    debounce((newContent: string) => {
-      if (!id) return;
+    debounce((newContent: string, docId: string) => {
       websocketService.sendContentChange(newContent);
-      documentService.update(id, { content: newContent }).catch(() => {
+      documentService.update(docId, { content: newContent }).catch(() => {
         toast.error('Failed to save');
       });
     }, 500),
-    [id]
+    []
   );
 
   const handleEditorChange = (value: string | undefined) => {
     const newContent = value || '';
     dispatch(setContent(newContent));
-    debouncedSave(newContent);
+
+    if (id) {
+      debouncedSave(newContent, id);
+    }
   };
 
   const handleCompile = async () => {
@@ -146,11 +167,14 @@ const EditorPage: React.FC = () => {
       if (result.success && result.pdf) {
         const binaryString = atob(result.pdf);
         const bytes = new Uint8Array(binaryString.length);
+
         for (let i = 0; i < binaryString.length; i++) {
           bytes[i] = binaryString.charCodeAt(i);
         }
+
         const blob = new Blob([bytes], { type: 'application/pdf' });
         const url = URL.createObjectURL(blob);
+
         dispatch(setPdfData({ pdfUrl: url, pdfData: bytes }));
         toast.success('Compiled successfully!');
       } else {
@@ -190,10 +214,12 @@ const EditorPage: React.FC = () => {
     editorRef.current = editor;
     monacoRef.current = monaco;
 
-    const monacoEditor = monaco as { editor: { defineTheme: (name: string, theme: object) => void; setTheme: (name: string) => void } };
-    const editorInstance = editor as { addCommand: (keybinding: number, handler: () => void) => void; getValue: () => string; setValue: (v: string) => void };
-    const KeyMod = (monaco as { KeyMod: { CtrlCmd: number } }).KeyMod;
-    const KeyCode = (monaco as { KeyCode: { KeyS: number; KeyP: number } }).KeyCode;
+    // Cast monaco to the correct type
+    const monacoEditor = monaco as typeof import('monaco-editor');
+    const editorInstance = editor as any;
+
+    const KeyMod = monacoEditor.KeyMod;
+    const KeyCode = monacoEditor.KeyCode;
 
     monacoEditor.editor.defineTheme('rueditor-dark', {
       base: 'vs-dark',
@@ -202,23 +228,13 @@ const EditorPage: React.FC = () => {
       colors: {
         'editor.background': '#0f172a',
         'editor.foreground': '#f1f5f9',
-        'editor.lineHighlightBackground': '#1e293b',
-        'editor.selectionBackground': '#0ea5e944',
-        'editorCursor.foreground': '#0ea5e9',
-        'editorLineNumber.foreground': '#64748b',
-        'editorLineNumber.activeForeground': '#94a3b8',
       },
     });
 
     monacoEditor.editor.setTheme('rueditor-dark');
 
-    editorInstance.addCommand(KeyMod.CtrlCmd | KeyCode.KeyS, () => {
-      handleManualSave();
-    });
-
-    editorInstance.addCommand(KeyMod.CtrlCmd | KeyCode.KeyP, () => {
-      handleCompile();
-    });
+    editorInstance.addCommand(KeyMod.CtrlCmd | KeyCode.KeyS, handleManualSave);
+    editorInstance.addCommand(KeyMod.CtrlCmd | KeyCode.KeyP, handleCompile);
   };
 
   return (
